@@ -1,0 +1,20 @@
+script:
+  server_uri: ldaps://URL:PORT
+  bind_dn: BIND_DN
+  bind_passwd: BIND_PASSWORT
+  search_base_dn: GROUP_SEARCH_BASE
+  group_cn: "GROUP*"
+  attributes:
+    - "ATTRIBUTE"
+users:
+  user-name:
+    streams:
+      - id: 484jfdladigjegoiregjieoj
+        role: Manager
+      - id: 483jfdladigjegoiregjieoj
+        role: Manager
+groups:
+  group-name:
+    streams:
+      - id: 483jfdladigjegoiregjieoj
+        role: Manager

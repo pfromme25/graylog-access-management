@@ -1,0 +1,173 @@
+#!/usr/bin/python3
+# Copyright (C) 2023 Philipp Fromme
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import argparse
+import configparser
+import logging
+import json
+import requests
+import ldap
+import yaml
+from graylogapi import GraylogApi
+
+logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%b %d %H:%M:%S',
+                    level='WARNING')
+LOGGER = logging.getLogger()
+
+def connect_to_ldap(server_uri, bind_dn, bind_passwd):
+    try:
+        conn = ldap.initialize(server_uri)
+        conn.protocol_version = ldap.VERSION3
+        conn.set_option(ldap.OPT_REFERRALS, 0)
+        conn.set_option(ldap.OPT_DEBUG_LEVEL, 255)
+        conn.simple_bind_s(bind_dn, bind_passwd)
+        return conn
+    except ldap.LDAPError as e:
+        raise Exception("Failed to connet to server {}: {}".format(server_uri, e))
+
+def get_ldap_groups(conn, search_base_dn, group_cn, attributes):
+    group_cn = "cn={}".format(group_cn)
+    ldap_result_id = conn.search(search_base_dn, ldap.SCOPE_SUBTREE, group_cn, attributes)
+    result_type, result_data = conn.result(ldap_result_id, 1)
+    return result_data
+
+def role_mapping(part, role, pid):
+    permissions = []
+    if role == 'Viewer' or role == 'Manager':
+        permissions.extend(['{}:read:{}'.format(part, pid)])
+    if role == ('Manager'):
+        permissions.extend(['{}:edit:{}'.format(part, pid)])
+        if part == "streams":
+            permissions.extend(['{}:changestate:{}'.format(part, pid)])
+    if permissions:
+        return permissions
+    return None
+
+def clean_permissions(permissions):
+    new_permissions = []
+    for permission in permissions:
+        if permission.startswith('streams'):
+            continue
+        new_permissions.append(permission)
+    return new_permissions
+
+def main():
+    parser = argparse.ArgumentParser(description="Set permissions for Graylog Users and their corresponding LDAP Groups")
+    parser.add_argument("--verbose", '-v', help="Set the output to verbose", action="store_true")
+    parser.add_argument("--level", "-l", help="Set the log level", default="WARNING")
+    args = parser.parse_args()
+
+    LOGGER.setLevel(args.level)
+
+    general_config_path = "/etc/graylog-api-scripts.conf"
+    general_config = configparser.ConfigParser()
+    general_config.read(general_config_path)
+    api_token = general_config['DEFAULTS']['token']
+
+    graylog = GraylogApi(api_token)
+
+    config_path = "/etc/graylog-access-management.yml"
+    with open(config_path, 'r') as stream:
+        config = yaml.safe_load(stream)
+    access_mapping = {}
+
+    script_config = config['script']
+    server_uri = script_config['server_uri']
+    bind_dn = script_config['bind_dn']
+    bind_passwd = script_config['bind_passwd']
+    search_base_dn = script_config['search_base_dn']
+    group_cn = script_config['group_cn']
+    attributes = script_config['attributes']
+
+    group_members = {}
+    conn = connect_to_ldap(server_uri, bind_dn, bind_passwd)
+    groups = get_ldap_groups(conn, search_base_dn, group_cn, attributes)
+    # sort what we found in ldap by throwing away everything 
+    # besides groups and who is a member in them
+    for group in groups:
+        name = group[0].split(",")[0].split("=")[1]
+        members = group[1]
+        group_members[name] = []
+        if "memberUid" in members:
+            members = members["memberUid"]
+            for member in members:
+                group_members[name].append(member.decode())
+
+    # Iterate over the configured groups and set the permissions to later add to each user of that group
+    group_permissions = {}
+    for group, permissions in config['groups'].items():
+        group_permissions[group] = []
+        if permissions == None:
+            continue
+        for stream in permissions['streams']:
+            stream_id = stream['id']
+            role = stream['role']
+            perm = role_mapping('streams', role, stream_id)
+            group_permissions[group].extend(perm)
+
+    users = graylog.get_users()
+    for graylog_user in users['users']:
+        username = graylog_user['username']
+        permissions = None
+        if username in config['users']:
+            permissions = config['users'][username]
+        user_id = graylog_user['id']
+        is_external = graylog_user['external']
+        if not is_external:
+            continue
+        old_permissions = graylog_user['permissions']
+        new_permissions = clean_permissions(old_permissions)
+        if permissions:
+            for stream in permissions['streams']:
+                stream_id = stream['id']
+                role = stream['role']
+                perm = role_mapping('streams', role, stream_id)
+                new_permissions.extend(perm)
+        # Now add the group permissions, if the user is a member of that ldap group
+        in_search_group = False
+        for group, members in group_members.items():
+            if username in members:
+                in_search_group = True
+                if group in group_permissions:
+                    new_permissions.extend(group_permissions[group])
+        if not in_search_group and is_external:
+            LOGGER.warning("%s not in any %s group, therefore deleting this graylog user with the following values: %s", username, group_cn, graylog_user)
+            graylog.delete_users_id(user_id)
+        removed_permissions = set(old_permissions).difference(set(new_permissions))
+        unchanged_permissions = set(old_permissions).intersection(set(new_permissions))
+        added_permissions = set(new_permissions).difference(set(old_permissions))
+        if args.verbose:
+            print(username)
+            if removed_permissions:
+                print('  Removed permissions:')
+                for stream in removed_permissions:
+                    print('    {}'.format(stream))
+            if added_permissions:
+                print('  Added permissions:')
+                for stream in added_permissions:
+                    print('    {}'.format(stream))
+            if unchanged_permissions:
+                print('  Unchanged permissions:')
+                for stream in unchanged_permissions:
+                    print('    {}'.format(stream))
+        if removed_permissions or added_permissions:
+            LOGGER.warning('Changed permissions of user %s by removing %s and adding %s', username, removed_permissions if removed_permissions else "nothing", added_permissions if added_permissions else "nothing")
+            graylog.put_users_permissions(username, new_permissions)
+        if unchanged_permissions:
+            LOGGER.debug('The following permissions of user %s remain unchanged %s', username, unchanged_permissions)
+
+if __name__ == "__main__":
+    main()
